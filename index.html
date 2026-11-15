@@ -1,0 +1,334 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Face Games Hub</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:system-ui,Arial,sans-serif;background:#12101f;color:#fff;min-height:100vh;display:flex;flex-direction:column;align-items:center}
+h1{margin:16px 0 4px;font-size:28px}
+#menu,#game{width:100%;max-width:720px;padding:12px;text-align:center}
+.card{background:#1f1b3a;border-radius:14px;padding:16px;margin:10px 0;cursor:pointer;border:2px solid #3b3566;transition:.15s}
+.card:hover{border-color:#ff6bcb;transform:translateY(-2px)}
+.card h2{font-size:20px}
+.card p{opacity:.75;font-size:14px;margin-top:4px}
+.card small{display:block;margin-top:6px;color:#ffd86b}
+#stage{position:relative;width:100%;aspect-ratio:4/3;background:#000;border-radius:14px;overflow:hidden}
+#cam{position:absolute;width:1px;height:1px;opacity:0;pointer-events:none}
+#cv{position:absolute;inset:0;width:100%;height:100%}
+#hud{display:flex;justify-content:space-between;margin:8px 0;font-size:18px}
+button{background:#ff6bcb;border:0;color:#fff;padding:10px 18px;border-radius:10px;font-size:16px;cursor:pointer;margin:6px}
+button:disabled{opacity:.4}
+#rec.on{background:#e11d48}
+#msg{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;text-align:center;font-size:22px;background:rgba(0,0,0,.6);padding:20px;white-space:pre-line}
+.hide{display:none!important}
+</style>
+</head>
+<body>
+<h1>Face Games Hub</h1>
+<div id="menu">
+  <p style="opacity:.7;margin-bottom:8px">Allow the camera, face the screen, pick a game</p>
+  <div class="card" data-g="flappy"><h2>Face Flappy</h2><p>Open mouth to fly up, close to fall. Dodge the pipes.</p><small id="b_flappy"></small></div>
+  <div class="card" data-g="brow"><h2>Eyebrow Reflex</h2><p>Green: raise your eyebrows fast. Red: stay still.</p><small id="b_brow"></small></div>
+  <div class="card" data-g="catch"><h2>Mouth Catch</h2><p>Move your head to move, open your mouth to eat fruit. Avoid bombs.</p><small id="b_catch"></small></div>
+  <div class="card" data-g="emoji"><h2>Emoji Copy</h2><p>Copy the emoji with your face before time runs out.</p><small id="b_emoji"></small></div>
+</div>
+<div id="game" class="hide">
+  <div id="hud"><span id="title"></span><span id="score">Score: 0</span></div>
+  <div id="stage">
+    <video id="cam" playsinline muted></video>
+    <canvas id="cv" width="640" height="480"></canvas>
+    <div id="msg">Loading...</div>
+  </div>
+  <button id="start" disabled>Start</button><button id="rec">Record</button><button id="back">Menu</button>
+</div>
+
+<script type="module">
+import {FaceLandmarker,FilesetResolver} from 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs';
+
+const $=id=>document.getElementById(id);
+const video=$('cam'),cv=$('cv'),ctx=cv.getContext('2d'),msg=$('msg');
+const W=640,H=480;
+let landmarker=null,stream=null,current=null,state='ready',score=0,lastVT=-1,tm=0,lost=0,acc=null;
+const face={ok:false,mouth:0,brow:0,smile:0,blink:0,blinkL:0,blinkR:0,pucker:0,tongue:0,frown:0,x:.5};
+const base={mouth:0,brow:0,smile:0,blink:0};
+const d=k=>face[k]-base[k];
+
+/* ---------- sound + particles ---------- */
+let ac=null;
+function beep(f,t=.08,type='sine',v=.07){
+  try{ac=ac||new (window.AudioContext||window.webkitAudioContext)();
+  const o=ac.createOscillator(),g=ac.createGain();o.type=type;o.frequency.value=f;g.gain.value=v;
+  o.connect(g);g.connect(ac.destination);o.start();
+  g.gain.exponentialRampToValueAtTime(.0001,ac.currentTime+t);o.stop(ac.currentTime+t);}catch(e){}
+}
+const ps=[];
+function burst(x,y,e){for(let i=0;i<8;i++)ps.push({x,y,vx:(Math.random()-.5)*400,vy:-Math.random()*300,l:.7,e});}
+function particles(dt){
+  ctx.font='26px serif';ctx.textAlign='center';
+  for(const p of ps){p.l-=dt;p.vy+=900*dt;p.x+=p.vx*dt;p.y+=p.vy*dt;ctx.globalAlpha=Math.max(0,p.l/.7);ctx.fillText(p.e,p.x,p.y);}
+  ctx.globalAlpha=1;
+  for(let i=ps.length-1;i>=0;i--)if(ps[i].l<=0)ps.splice(i,1);
+}
+function txt(s,x,y,size=24,col='#fff'){ctx.fillStyle=col;ctx.textAlign='center';ctx.font='bold '+size+'px system-ui';ctx.fillText(s,x,y);}
+
+/* ---------- camera + face model ---------- */
+async function initModel(){
+  if(landmarker)return;
+  const fs=await FilesetResolver.forVisionTasks('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm');
+  const mk=del=>FaceLandmarker.createFromOptions(fs,{
+    baseOptions:{modelAssetPath:'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task',delegate:del},
+    runningMode:'VIDEO',numFaces:1,outputFaceBlendshapes:true});
+  try{landmarker=await mk('GPU');}catch(e){landmarker=await mk('CPU');}
+}
+async function initCam(){
+  if(stream)return;
+  stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:'user',width:640,height:480},audio:false});
+  video.srcObject=stream;await video.play();
+}
+function readFace(){
+  if(!landmarker||video.readyState<2||video.currentTime===lastVT)return;
+  lastVT=video.currentTime;
+  let r;try{r=landmarker.detectForVideo(video,performance.now());}catch(e){return;}
+  if(r.faceLandmarks&&r.faceLandmarks.length&&r.faceBlendshapes&&r.faceBlendshapes.length){
+    const b={};r.faceBlendshapes[0].categories.forEach(c=>b[c.categoryName]=c.score);
+    face.ok=true;
+    face.mouth=b.jawOpen||0;
+    face.brow=Math.max(b.browInnerUp||0,((b.browOuterUpLeft||0)+(b.browOuterUpRight||0))/2);
+    face.smile=((b.mouthSmileLeft||0)+(b.mouthSmileRight||0))/2;
+    face.blinkL=b.eyeBlinkLeft||0;face.blinkR=b.eyeBlinkRight||0;face.blink=(face.blinkL+face.blinkR)/2;
+    face.pucker=b.mouthPucker||0;face.tongue=b.tongueOut||0;
+    face.frown=((b.browDownLeft||0)+(b.browDownRight||0))/2;
+    const vw=video.videoWidth||W,vh=video.videoHeight||H,s=Math.max(W/vw,H/vh);
+    const nx=r.faceLandmarks[0][1].x;
+    face.x=Math.max(0,Math.min(1,((1-nx)*vw*s-(vw*s-W)/2)/W)); // mirrored, matches what you see
+  }else face.ok=false;
+}
+function drawCam(){
+  ctx.fillStyle='#000';ctx.fillRect(0,0,W,H);
+  const vw=video.videoWidth,vh=video.videoHeight;if(!vw)return;
+  const s=Math.max(W/vw,H/vh),w=vw*s,h=vh*s;
+  ctx.save();ctx.translate(W,0);ctx.scale(-1,1);ctx.drawImage(video,(W-w)/2,(H-h)/2,w,h);ctx.restore();
+}
+
+/* ---------- GAMES ---------- */
+const games={};
+
+games.flappy={
+  title:'Face Flappy',
+  help:'Open your mouth to fly up.\nClose it to fall.\nKeep a neutral face while it calibrates.',
+  init(){this.y=H/2;this.v=0;this.pipes=[];this.dist=200;
+    this.clouds=Array.from({length:6},()=>({x:Math.random()*W,y:30+Math.random()*220,s:.5+Math.random()*.7}));},
+  update(dt){
+    const open=d('mouth')>.3;
+    this.v+=(open?-1000:760)*dt;this.v=Math.max(-340,Math.min(400,this.v));
+    this.y+=this.v*dt;
+    const sp=170+Math.min(score,25)*5;
+    this.clouds.forEach(c=>{c.x-=sp*.25*c.s*dt;if(c.x<-60)c.x=W+60;});
+    this.dist+=sp*dt;
+    if(this.dist>270){this.dist=0;const gap=Math.max(150,190-score*2);this.pipes.push({x:W+20,gy:70+Math.random()*(H-140-gap),gap,passed:false});}
+    this.pipes.forEach(p=>p.x-=sp*dt);
+    this.pipes=this.pipes.filter(p=>p.x>-80);
+    if(this.y<10||this.y>H-10){beep(130,.3,'sawtooth');return end();}
+    for(const p of this.pipes){
+      if(!p.passed&&p.x+60<124){p.passed=true;score++;beep(700,.06);}
+      if(156>p.x&&124<p.x+60&&(this.y-16<p.gy||this.y+16>p.gy+p.gap)){beep(130,.3,'sawtooth');return end();}
+    }
+  },
+  draw(){
+    ctx.fillStyle='rgba(20,40,90,.35)';ctx.fillRect(0,0,W,H);
+    ctx.font='48px serif';ctx.textAlign='center';ctx.globalAlpha=.8;
+    this.clouds.forEach(c=>{ctx.save();ctx.translate(c.x,c.y);ctx.scale(c.s,c.s);ctx.fillText('☁️',0,0);ctx.restore();});
+    ctx.globalAlpha=1;
+    this.pipes.forEach(p=>{
+      ctx.fillStyle='#22c55e';ctx.fillRect(p.x,0,60,p.gy);ctx.fillRect(p.x,p.gy+p.gap,60,H-p.gy-p.gap);
+      ctx.fillStyle='#15803d';ctx.fillRect(p.x-4,p.gy-16,68,16);ctx.fillRect(p.x-4,p.gy+p.gap,68,16);});
+    ctx.save();ctx.translate(140,this.y);ctx.rotate(Math.max(-.5,Math.min(.8,this.v/500)));
+    ctx.scale(-1,1); // the bird emoji looks left by default, flip so it faces the pipes
+    ctx.font='40px serif';ctx.textAlign='center';ctx.fillText('🐦',0,12);ctx.restore();
+    ctx.fillStyle='rgba(255,255,255,.25)';ctx.fillRect(10,H-20,100,8);
+    ctx.fillStyle='#ff6bcb';ctx.fillRect(10,H-20,Math.min(1,Math.max(0,d('mouth'))/.3)*100,8);
+  }
+};
+
+games.brow={
+  title:'Eyebrow Reflex',
+  help:'Green = raise your eyebrows fast.\nRed = keep still.\n10 rounds.',
+  init(){this.s='wait';this.timer=1.2+Math.random()*2;this.round=0;this.times=[];this.cool=0;this.info='Get ready...';},
+  update(dt){
+    if(this.cool>0){this.cool-=dt;return;}
+    const up=d('brow')>.3;
+    if(this.s==='wait'){
+      if(up){this.info='Too early!';score=Math.max(0,score-2);beep(150,.2,'sawtooth');return this.next(true);}
+      this.timer-=dt;
+      if(this.timer<=0){this.s=Math.random()<.72?'go':'stop';this.at=performance.now();beep(this.s==='go'?660:200,.1);}
+      return;
+    }
+    const el=performance.now()-this.at;
+    if(this.s==='go'){
+      if(up){this.times.push(Math.round(el));score+=Math.max(1,Math.round((900-el)/60));this.info=Math.round(el)+' ms';burst(W/2,H/2,'⭐');beep(880);this.next();}
+      else if(el>1500){this.info='Too slow!';this.next();}
+    }else{
+      if(up){this.info='That was red!';score=Math.max(0,score-5);beep(150,.25,'sawtooth');this.next();}
+      else if(el>1300){this.info='Nice, stayed cool';score+=3;beep(520);this.next();}
+    }
+  },
+  next(early){this.s='wait';this.timer=1.2+Math.random()*2.2;this.cool=early?1.2:.9;if(!early)this.round++;if(this.round>=10)setTimeout(end,700);},
+  draw(){
+    ctx.fillStyle=this.s==='go'?'rgba(34,197,94,.7)':this.s==='stop'?'rgba(239,68,68,.7)':'rgba(0,0,0,.35)';
+    ctx.fillRect(0,0,W,H);
+    txt(this.s==='go'?'RAISE!':this.s==='stop'?"DON'T!":this.info,W/2,H/2,44);
+    txt('Round '+Math.min(this.round+1,10)+'/10',W/2,40,20);
+    if(this.times.length)txt('Avg: '+Math.round(this.times.reduce((a,b)=>a+b,0)/this.times.length)+' ms',W/2,H-30,20);
+  }
+};
+
+games.catch={
+  title:'Mouth Catch',
+  help:'Move your head left and right.\nOpen wide to eat fruit.\nBombs cost a life!',
+  init(){this.items=[];this.t=0;this.lives=3;this.px=W/2;this.combo=0;this.open=false;},
+  update(dt){
+    this.t+=dt;
+    if(this.t>Math.max(.45,.9-score*.01)){this.t=0;const bomb=Math.random()<.2;
+      this.items.push({x:50+Math.random()*(W-100),y:-30,bomb,e:bomb?'💣':['🍎','🍌','🍉','🍇','🍓','🍍'][Math.floor(Math.random()*6)],s:150+Math.random()*100+Math.min(score,40)*4});}
+    this.px+=(face.x*W-this.px)*Math.min(1,dt*14);
+    this.open=d('mouth')>.3;
+    for(const i of this.items){
+      i.y+=i.s*dt;
+      if(i.y>H-120&&i.y<H-20&&Math.abs(i.x-this.px)<55&&this.open){
+        i.dead=true;
+        if(i.bomb){this.lives--;this.combo=0;burst(i.x,i.y,'💥');beep(120,.3,'sawtooth');}
+        else{this.combo++;score+=1+Math.floor(this.combo/5);burst(i.x,i.y,'✨');beep(600+Math.min(this.combo,15)*20,.07);}
+      }
+      if(i.y>H+30){if(!i.bomb&&!i.dead)this.combo=0;i.dead=true;}
+    }
+    this.items=this.items.filter(i=>!i.dead);
+    if(this.lives<=0)end();
+  },
+  draw(){
+    ctx.fillStyle='rgba(0,0,0,.25)';ctx.fillRect(0,0,W,H);
+    ctx.font='34px serif';ctx.textAlign='center';
+    this.items.forEach(i=>ctx.fillText(i.e,i.x,i.y));
+    ctx.font='60px serif';ctx.fillText(this.open?'😮':'😐',this.px,H-50);
+    ctx.font='22px serif';ctx.textAlign='left';ctx.fillText('❤️'.repeat(Math.max(0,this.lives)),10,30);
+    if(this.combo>1)txt('Combo x'+this.combo,W/2,36,22,'#ffd86b');
+  }
+};
+
+const EMOJIS=[
+  {e:'😮',n:'Surprised',t:()=>face.mouth>.4&&d('brow')>.25},
+  {e:'😄',n:'Big smile',t:()=>face.smile>.55},
+  {e:'😉',n:'Wink',t:()=>Math.abs(face.blinkL-face.blinkR)>.45},
+  {e:'😗',n:'Kiss face',t:()=>face.pucker>.5},
+  {e:'😛',n:'Tongue out',t:()=>face.tongue>.2},
+  {e:'😑',n:'Eyes closed',t:()=>face.blink>.7},
+  {e:'🤨',n:'Raised brow',t:()=>d('brow')>.4&&face.mouth<.2},
+  {e:'😠',n:'Angry',t:()=>face.frown>.5}
+];
+games.emoji={
+  title:'Emoji Copy',
+  help:'Copy the emoji with your face.\nYou have 4 seconds each.\n10 rounds.',
+  init(){this.round=0;this.last=-1;this.pick();},
+  pick(){let i;do{i=Math.floor(Math.random()*EMOJIS.length);}while(i===this.last);
+    this.last=i;this.cur=EMOJIS[i];this.left=4;this.hold=0;this.flash=0;this.ok=true;},
+  update(dt){
+    if(this.flash>0){this.flash-=dt;if(this.flash<=0){this.round++;if(this.round>=10)return end();this.pick();}return;}
+    this.left-=dt;
+    if(this.cur.t()){this.hold+=dt;if(this.hold>.35){score+=Math.ceil(this.left*2);this.flash=.7;this.ok=true;burst(W/2,H/2,'🎉');beep(784,.12);}}
+    else this.hold=0;
+    if(this.left<=0&&this.flash<=0){this.flash=.7;this.ok=false;beep(150,.25,'sawtooth');}
+  },
+  draw(){
+    ctx.fillStyle=this.flash>0?(this.ok?'rgba(34,197,94,.45)':'rgba(239,68,68,.45)'):'rgba(0,0,0,.35)';
+    ctx.fillRect(0,0,W,H);
+    ctx.font='120px serif';ctx.textAlign='center';ctx.fillText(this.cur.e,W/2,H/2+30);
+    txt(this.cur.n,W/2,H/2+85,28);
+    ctx.fillStyle='#ff6bcb';ctx.fillRect(0,H-12,W*Math.max(0,this.left)/4,12);
+    ctx.fillStyle='#fff';ctx.fillRect(0,H-18,W*Math.min(1,this.hold/.35),4);
+    txt('Round '+Math.min(this.round+1,10)+'/10',W/2,36,20);
+  }
+};
+
+/* ---------- ENGINE ---------- */
+function calib(dt){
+  ctx.fillStyle='rgba(0,0,0,.5)';ctx.fillRect(0,0,W,H);
+  txt(face.ok?'Keep a neutral face...':'No face detected',W/2,H/2,34);
+  if(!face.ok){acc=null;tm=0;return;}
+  if(!acc)acc={mouth:0,brow:0,smile:0,blink:0,n:0};
+  tm+=dt;acc.n++;for(const k in base)acc[k]+=face[k];
+  if(tm>1.3&&acc.n>5){for(const k in base)base[k]=acc[k]/acc.n;state='count';tm=3;}
+}
+function play(dt){
+  lost=face.ok?0:lost+dt;
+  if(lost>.5){current.draw();ctx.fillStyle='rgba(0,0,0,.6)';ctx.fillRect(0,0,W,H);txt('Face lost, look at the camera',W/2,H/2,28);return;}
+  current.update(dt);
+  if(state==='play')current.draw();
+}
+let last=0;
+function frame(ts){
+  requestAnimationFrame(frame);
+  if(!current)return;
+  const dt=Math.min(.05,(ts-last)/1000||0);last=ts;
+  drawCam();readFace();
+  if(state==='calib')calib(dt);
+  else if(state==='count'){
+    ctx.fillStyle='rgba(0,0,0,.4)';ctx.fillRect(0,0,W,H);
+    txt(String(Math.max(1,Math.ceil(tm))),W/2,H/2+40,120);
+    tm-=dt;if(tm<=0){current.init();state='play';lost=0;}
+  }else if(state==='play')play(dt);
+  particles(dt);
+  $('score').textContent='Score: '+score;
+}
+requestAnimationFrame(frame);
+
+function best(g){return +(localStorage.getItem('fg_'+g.title)||0);}
+function renderMenu(){for(const k in games)$('b_'+k).textContent='Best: '+best(games[k]);}
+function end(){
+  if(state==='over')return;
+  state='over';
+  const b=Math.max(score,best(current));localStorage.setItem('fg_'+current.title,b);
+  msg.classList.remove('hide');
+  msg.textContent='Game over\nScore: '+score+'\nBest: '+b;
+  $('start').textContent='Play again';
+}
+function start(){
+  score=0;state='calib';tm=0;acc=null;lost=0;ps.length=0;
+  msg.classList.add('hide');beep(440,.05);
+}
+
+document.querySelectorAll('.card').forEach(c=>c.onclick=async()=>{
+  current=games[c.dataset.g];state='ready';score=0;
+  $('menu').classList.add('hide');$('game').classList.remove('hide');
+  $('title').textContent=current.title;$('start').textContent='Start';$('start').disabled=true;
+  msg.classList.remove('hide');msg.textContent='Loading camera and face model...';
+  try{
+    await initCam();await initModel();
+    msg.textContent=current.help+'\n\nPress Start';$('start').disabled=false;
+  }catch(e){msg.textContent='Camera or model failed.\nAllow camera access, and use HTTPS or localhost.';}
+});
+$('start').onclick=()=>{if(landmarker)start();};
+$('back').onclick=()=>{
+  if(rec)rec.stop();
+  state='ready';current=null;$('game').classList.add('hide');$('menu').classList.remove('hide');renderMenu();
+};
+
+/* ---------- record the canvas (camera + game) ---------- */
+let rec=null,chunks=[];
+$('rec').onclick=()=>{
+  if(rec){rec.stop();return;}
+  const mt=['video/webm;codecs=vp9','video/webm','video/mp4'].find(t=>window.MediaRecorder&&MediaRecorder.isTypeSupported(t));
+  if(!mt){alert('Recording is not supported in this browser');return;}
+  rec=new MediaRecorder(cv.captureStream(30),{mimeType:mt});chunks=[];
+  rec.ondataavailable=e=>{if(e.data.size)chunks.push(e.data);};
+  rec.onstop=()=>{
+    const a=document.createElement('a');a.href=URL.createObjectURL(new Blob(chunks,{type:mt}));
+    a.download='face-game.'+(mt.includes('mp4')?'mp4':'webm');a.click();
+    rec=null;$('rec').textContent='Record';$('rec').classList.remove('on');
+  };
+  rec.start();$('rec').textContent='Stop and save';$('rec').classList.add('on');
+};
+renderMenu();
+</script>
+</body>
+</html>
